@@ -13,8 +13,10 @@ import (
 	"strings"
 	"text/template"
 
-	md "github.com/shurcooL/github_flavored_markdown"
+	"github.com/fsnotify/fsnotify"
+	"github.com/shurcooL/github_flavored_markdown"
 	"github.com/shurcooL/github_flavored_markdown/gfmstyle"
+	"github.com/spf13/hugo/livereload"
 )
 
 const (
@@ -64,6 +66,9 @@ const (
       {{.Content}}
       </article>
     </div>
+		<script data-no-instant>
+			document.write('<script src="/livereload.js?port={{.Port}}&mindelay=10"></' + 'script>')
+		</script>
 	</body>
 </html>`
 )
@@ -74,32 +79,32 @@ var (
 )
 
 type (
-	ResponseWriter struct{ http.ResponseWriter }
-	dict           map[string]interface{}
+	Server struct {
+		Host      string
+		Port      int
+		Directory string
+	}
+	dict map[string]interface{}
 )
 
-func (rw *ResponseWriter) WriteHeader(statusCode int) {
-	rw.Header().Set("Status", fmt.Sprintf("%d", statusCode))
-	rw.ResponseWriter.WriteHeader(statusCode)
-}
-
-func logger(w http.ResponseWriter, r *http.Request) {
-	std.Printf("%s %s %s", r.Method, r.URL, w.Header().Get("Status"))
-}
-
-func render(w http.ResponseWriter, path string) {
+func (s *Server) Render(w http.ResponseWriter, path string) {
 	std.Printf("Rendering %s", path)
 	content, err := ioutil.ReadFile(path)
 	if err == nil {
-		err = t.Execute(w, dict{
+		err = s.Execute(w, dict{
 			"File":    filepath.Base(path),
-			"Content": string(md.Markdown(content)),
+			"Content": string(github_flavored_markdown.Markdown(content)),
 		})
 	}
-	errorHandling(w, err)
+	s.errorHandling(w, err)
 }
 
-func errorHandling(w http.ResponseWriter, err error) {
+func (s *Server) Execute(w io.Writer, d dict) error {
+	d["Port"] = s.Port
+	return t.Execute(w, d)
+}
+
+func (s *Server) errorHandling(w http.ResponseWriter, err error) {
 	switch {
 	case err == nil:
 		return
@@ -110,7 +115,7 @@ func errorHandling(w http.ResponseWriter, err error) {
 			"Content": "<h1>404: Page Not Found</h1>",
 		}
 
-		if err = t.Execute(w, data); err == nil {
+		if err = s.Execute(w, data); err == nil {
 			return
 		}
 		fallthrough
@@ -120,57 +125,109 @@ func errorHandling(w http.ResponseWriter, err error) {
 			"Content": fmt.Sprintf("<h1>500 Internal Server Error: %s</h1>", err),
 		}
 		w.WriteHeader(http.StatusInternalServerError)
-		if err = t.Execute(w, data); err != nil {
+		if err = s.Execute(w, data); err != nil {
 			std.Println(err)
 		}
 	}
 }
-
-func handler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	static := http.StripPrefix("/static", http.FileServer(gfmstyle.Assets))
+	uri := r.URL.Path
 
 	switch {
-	case strings.HasPrefix(r.RequestURI, "/static/"):
+	case uri == "/livereload":
+		livereload.Handler(w, r)
+	case uri == "/livereload.js":
+		livereload.ServeJS(w, r)
+	case strings.HasPrefix(uri, "/static/"):
 		static.ServeHTTP(w, r)
-	case strings.HasSuffix(r.RequestURI, "/"):
+	case strings.HasSuffix(uri, "/"):
 		// something has to be done for windows support
-		render(w, path.Join(r.RequestURI[1:], "README.md"))
-	case strings.HasSuffix(r.RequestURI, ".md"):
-		render(w, r.RequestURI[1:])
+		s.Render(w, path.Join(uri[1:], "README.md"))
+	case strings.HasSuffix(uri, ".md"):
+		s.Render(w, uri[1:])
 	default:
-		if file, err := os.Open(r.RequestURI[1:]); err != nil {
-			errorHandling(w, err)
+		if file, err := os.Open(uri[1:]); err != nil {
+			s.errorHandling(w, err)
 		} else if _, err := io.Copy(w, file); err != nil {
-			errorHandling(w, err)
+			s.errorHandling(w, err)
 		}
 	}
+	std.Printf("%s %s %s", r.Method, r.URL, w.Header().Get("Status"))
+}
+
+func newWatcher() (watcher *fsnotify.Watcher, err error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return
+	}
+	watcher, err = fsnotify.NewWatcher()
+	if err != nil {
+		return
+	}
+
+	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(filepath.Base(info.Name()), ".") {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			watcher.Add(path)
+		}
+		return nil
+	})
+	if err != nil {
+		watcher.Close()
+	}
+	return
+}
+
+func (s *Server) Addr() string { return fmt.Sprintf("%s:%d", s.Host, s.Port) }
+
+func (s *Server) Run() error {
+	if err := os.Chdir(s.Directory); err != nil {
+		return err
+	}
+	watcher, err := newWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+	livereload.Initialize()
+
+	go func() { // start watching events
+		for {
+			select {
+			case event := <-watcher.Events:
+				if event.Op&fsnotify.Write == fsnotify.Write {
+					livereload.ForceRefresh()
+				}
+			case err := <-watcher.Errors:
+				std.Println("error:", err)
+			}
+		}
+	}()
+	server := &http.Server{
+		Addr:     s.Addr(),
+		Handler:  s,
+		ErrorLog: std,
+	}
+
+	std.Printf("Serving directory: %s on %s...", s.Directory, s.Addr())
+	return server.ListenAndServe()
 }
 
 func main() {
-	var host string
-	var port int
-	var directory string
+	server := &Server{}
 
-	flag.StringVar(&host, "h", "localhost", "Hostname from which the server will serve request")
-	flag.IntVar(&port, "p", 5678, "Port on which the server will serve request")
+	flag.StringVar(&server.Host, "h", "localhost", "Hostname from which the server will serve request")
+	flag.IntVar(&server.Port, "p", 5678, "Port on which the server will serve request")
 	flag.Parse()
 
-	if directory = flag.Arg(0); directory == "" {
-		directory = "."
+	if server.Directory = flag.Arg(0); server.Directory == "" {
+		server.Directory = "."
 	}
-	if err := os.Chdir(directory); err != nil {
-		std.Fatalln(err)
-	}
-
-	server := &http.Server{
-		Addr: fmt.Sprintf("%s:%d", host, port),
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w = &ResponseWriter{w}
-			handler(w, r)
-			logger(w, r)
-		}),
-		ErrorLog: std,
-	}
-	std.Printf("Serving directory: %s on %s:%d...", directory, host, port)
-	std.Fatalln(server.ListenAndServe())
+	std.Fatalln(server.Run())
 }
