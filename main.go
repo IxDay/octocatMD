@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"path"
@@ -73,8 +72,7 @@ const (
 )
 
 var (
-	t   = template.Must(template.New("html").Parse(html))
-	std = log.New(os.Stderr, "", log.LstdFlags)
+	t = template.Must(template.New("html").Parse(html))
 )
 
 type (
@@ -82,12 +80,13 @@ type (
 		Host      string
 		Port      int
 		Directory string
+		Logger
 	}
 	dict map[string]interface{}
 )
 
 func (s *Server) Render(w http.ResponseWriter, path string) {
-	std.Printf("Rendering %s", path)
+	s.Log(INFO, "Rendering %s", path)
 	content, err := ioutil.ReadFile(path)
 	if err == nil {
 		err = s.Execute(w, dict{
@@ -125,7 +124,7 @@ func (s *Server) errorHandling(w http.ResponseWriter, err error) {
 		}
 		w.WriteHeader(http.StatusInternalServerError)
 		if err = s.Execute(w, data); err != nil {
-			std.Println(err)
+			s.Log(ERROR, "Failed to render page: %q", err)
 		}
 	}
 }
@@ -152,7 +151,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			s.errorHandling(w, err)
 		}
 	}
-	std.Printf("%s %s %s", r.Method, r.URL, w.Header().Get("Status"))
+	s.Log(INFO, "%s %s %s", r.Method, r.URL, w.Header().Get("Status"))
 }
 
 func (s *Server) Addr() string { return fmt.Sprintf("%s:%d", s.Host, s.Port) }
@@ -177,35 +176,41 @@ func (s *Server) Run() error {
 					livereload.ForceRefresh()
 				case create:
 					if err := filepath.Walk(event.Name, walkFunc(watcher)); err != nil {
-						std.Printf("Failed to walk newly created directory: %q", err)
+						s.Log(ERROR, "Failed to walk newly created directory: %q", err)
 					}
 				case remove:
 					watcher.Remove(event.Name)
 				}
 			case err := <-watcher.Errors:
-				std.Printf("Caught notify error: %q", err)
+				s.Log(ERROR, "Caught notify error: %q", err)
 			}
 		}
 	}()
 	server := &http.Server{
-		Addr:     s.Addr(),
-		Handler:  s,
-		ErrorLog: std,
+		Addr:    s.Addr(),
+		Handler: s,
 	}
 
-	std.Printf("Serving directory: %s on %s...", s.Directory, s.Addr())
+	s.Log(INFO, "Serving directory: %s on %s...", s.Directory, s.Addr())
 	return server.ListenAndServe()
 }
 
 func main() {
+	level := INFO
+	debug := false
 	server := &Server{}
 
 	flag.StringVar(&server.Host, "h", "localhost", "Hostname from which the server will serve request")
 	flag.IntVar(&server.Port, "p", 5678, "Port on which the server will serve request")
+	flag.BoolVar(&debug, "d", false, "Debug mode, increase log level")
 	flag.Parse()
 
 	if server.Directory = flag.Arg(0); server.Directory == "" {
 		server.Directory = "."
 	}
+	if debug {
+		level = DEBUG
+	}
+	server.Logger = NewStdLogger(std, level)
 	std.Fatalln(server.Run())
 }
