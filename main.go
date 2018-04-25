@@ -160,38 +160,22 @@ func (s *Server) Run() error {
 	if err := os.Chdir(s.Directory); err != nil {
 		return err
 	}
-	watcher, err := newWatcher()
+	watcher, err := NewWatcher(s.Logger)
 	if err != nil {
 		return err
 	}
 	defer watcher.Close()
 	livereload.Initialize()
 
-	go func() { // start watching events
-		for {
-			select {
-			case event := <-watcher.Events:
-				switch getOp(event) {
-				case write:
-					livereload.ForceRefresh()
-				case create:
-					if err := filepath.Walk(event.Name, walkFunc(watcher)); err != nil {
-						s.Log(ERROR, "Failed to walk newly created directory: %q", err)
-					}
-				case remove:
-					watcher.Remove(event.Name)
-				}
-			case err := <-watcher.Errors:
-				s.Log(ERROR, "Caught notify error: %q", err)
-			}
-		}
-	}()
+	go watcher.Start(func(_ string) { livereload.ForceRefresh() })
+
 	server := &http.Server{
 		Addr:    s.Addr(),
 		Handler: s,
 	}
 
 	s.Log(INFO, "Serving directory: %s on %s...", s.Directory, s.Addr())
+	s.Log(DEBUG, "Debug mode enabled")
 	return server.ListenAndServe()
 }
 
