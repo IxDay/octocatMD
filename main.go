@@ -156,32 +156,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	std.Printf("%s %s %s", r.Method, r.URL, w.Header().Get("Status"))
 }
 
-func newWatcher() (watcher *fsnotify.Watcher, err error) {
-	dir, err := os.Getwd()
-	if err != nil {
-		return
-	}
-	watcher, err = fsnotify.NewWatcher()
-	if err != nil {
-		return
-	}
-
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+func walkFunc(watcher *fsnotify.Watcher) filepath.WalkFunc {
+	return func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if strings.HasPrefix(filepath.Base(info.Name()), ".") {
-			return filepath.SkipDir
-		}
 		if info.IsDir() {
+			if strings.HasPrefix(filepath.Base(info.Name()), ".") {
+				return filepath.SkipDir
+			}
+
 			watcher.Add(path)
 		}
 		return nil
-	})
-	if err != nil {
-		watcher.Close()
 	}
-	return
+}
+
+func newWatcher() (*fsnotify.Watcher, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := filepath.Walk(dir, walkFunc(watcher)); err != nil {
+		watcher.Close()
+		return nil, err
+	}
+	return watcher, nil
 }
 
 func (s *Server) Addr() string { return fmt.Sprintf("%s:%d", s.Host, s.Port) }
