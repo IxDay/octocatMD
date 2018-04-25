@@ -71,6 +71,10 @@ const (
 		</script>
 	</body>
 </html>`
+	noop op = iota
+	create
+	write
+	remove
 )
 
 var (
@@ -85,6 +89,7 @@ type (
 		Directory string
 	}
 	dict map[string]interface{}
+	op   uint32
 )
 
 func (s *Server) Render(w http.ResponseWriter, path string) {
@@ -189,6 +194,25 @@ func newWatcher() (*fsnotify.Watcher, error) {
 	return watcher, nil
 }
 
+func getOp(event fsnotify.Event) op {
+	if event.Op == fsnotify.Remove || event.Op == fsnotify.Rename {
+		return remove
+	}
+	info, err := os.Stat(event.Name)
+	if err != nil {
+		std.Printf("Failed to stat event target file: %q", err)
+		return noop
+	}
+	if !info.IsDir() {
+		if event.Op == fsnotify.Write {
+			return write
+		}
+	} else if event.Op == fsnotify.Create {
+		return create
+	}
+	return noop
+}
+
 func (s *Server) Addr() string { return fmt.Sprintf("%s:%d", s.Host, s.Port) }
 
 func (s *Server) Run() error {
@@ -206,11 +230,18 @@ func (s *Server) Run() error {
 		for {
 			select {
 			case event := <-watcher.Events:
-				if event.Op&fsnotify.Write == fsnotify.Write {
+				switch getOp(event) {
+				case write:
 					livereload.ForceRefresh()
+				case create:
+					if err := filepath.Walk(event.Name, walkFunc(watcher)); err != nil {
+						std.Printf("Failed to walk newly created directory: %q", err)
+					}
+				case remove:
+					watcher.Remove(event.Name)
 				}
 			case err := <-watcher.Errors:
-				std.Println("error:", err)
+				std.Printf("Caught notify error: %q", err)
 			}
 		}
 	}()
